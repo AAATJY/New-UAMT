@@ -47,7 +47,7 @@ parser.add_argument('--num_classes', type=int,  default=4,
 # label and unlabel
 parser.add_argument('--labeled_bs', type=int, default=12,
                     help='labeled_batch_size per gpu')
-parser.add_argument('--labeled_num', type=int, default=136,
+parser.add_argument('--labeled_num', type=int, default=7,
                     help='labeled data')
 # costs
 parser.add_argument('--ema_decay', type=float,  default=0.99, help='ema_decay')
@@ -82,8 +82,7 @@ def update_ema_variables(model, ema_model, alpha, global_step):
     # Use the true average until the exponential average is more correct
     alpha = min(1 - 1 / (global_step + 1), alpha)
     for ema_param, param in zip(ema_model.parameters(), model.parameters()):
-        ema_param.data.mul_(alpha).add_(1 - alpha, param.data)
-
+        ema_param.data.mul_(alpha).add_(param.data, alpha=1 - alpha)
 
 def train(args, snapshot_path):
     base_lr = args.base_lr
@@ -94,6 +93,7 @@ def train(args, snapshot_path):
     def create_model(ema=False):
         # Network definition
         model = UNet( in_chns=1,class_num=num_classes)
+        model.cuda()
         if ema:
             for param in model.parameters():
                 param.detach_()
