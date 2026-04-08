@@ -215,14 +215,12 @@ def contrastive_loss(anchor_centers: dict,
         pos_mem     = pos_mem.to(device)
         neg_mem_all = neg_mem_all.to(device)
 
-        # L2-normalise anchors (memory is already normalised)
+        # L2-normalise anchors; memory vectors are already normalised on storage
         anchors_n = F.normalize(anchors, dim=1)  # [M, C]
-        pos_n     = F.normalize(pos_mem, dim=1)  # [P, C]
-        neg_n     = F.normalize(neg_mem_all, dim=1)  # [N, C]
 
         # Similarity: [M, P] and [M, N]
-        sim_pos = torch.mm(anchors_n, pos_n.T) / tau   # [M, P]
-        sim_neg = torch.mm(anchors_n, neg_n.T) / tau   # [M, N]
+        sim_pos = torch.mm(anchors_n, pos_mem.T) / tau   # [M, P]
+        sim_neg = torch.mm(anchors_n, neg_mem_all.T) / tau   # [M, N]
 
         # Numerator: log-sum-exp over positives (per anchor)
         log_num = torch.logsumexp(sim_pos, dim=1)       # [M]

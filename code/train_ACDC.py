@@ -230,10 +230,14 @@ def train(args, snapshot_path):
             lcon_high_val = 0.0
 
             if args.use_freq_contrast:
-                # 1) Decompose the FULL batch into low- and high-frequency views
-                with torch.no_grad():
-                    x_low, x_high = freq_decompose(volume_batch,
-                                                   ratio=args.freq_low_ratio)
+                # 1) Decompose the FULL batch into low- and high-frequency views.
+                #    freq_decompose is differentiable; we detach x_low/x_high here
+                #    so gradients only flow through the encoder weights, not back
+                #    into the input pixel values (same as for the original branch).
+                x_low, x_high = freq_decompose(volume_batch,
+                                               ratio=args.freq_low_ratio)
+                x_low  = x_low.detach()
+                x_high = x_high.detach()
 
                 # 2) Encode the two frequency views with the STUDENT encoder
                 #    (shared weights; gradients flow through feat_low/feat_high)
