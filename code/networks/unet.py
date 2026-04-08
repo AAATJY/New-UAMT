@@ -313,9 +313,25 @@ class UNet(nn.Module):
         self.encoder = Encoder(params)
         self.decoder = Decoder(params)
 
-    def forward(self, x):
+    def forward(self, x, return_features=False):
+        """Forward pass.
+
+        Args:
+            x:               Input tensor ``[B, in_chns, H, W]``.
+            return_features: When ``True``, also return the deepest encoder
+                             feature map ``x4`` (shape ``[B, 256, H/16, W/16]``)
+                             which is used as the anchor for contrastive learning.
+
+        Returns:
+            output (Tensor): Segmentation logits ``[B, class_num, H, W]``.
+            feat   (Tensor): Deepest encoder feature ``[B, 256, H/16, W/16]``.
+                             Only returned when ``return_features=True``.
+        """
         feature = self.encoder(x)
         output = self.decoder(feature)
+        if return_features:
+            # feature[4] is x4 – the bottleneck (deepest encoder) output
+            return output, feature[4]
         return output
 
 
