@@ -1,7 +1,6 @@
 import argparse
 import logging
 import os
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 import random
 import shutil
 import sys
@@ -22,6 +21,9 @@ from dataloaders.dataset import (BaseDataSets, RandomGenerator,
                                  TwoStreamBatchSampler)
 from utils import losses, ramps
 from val_2D import test_single_volume
+from utils.frequency import freq_decompose
+from utils.freq_contrast import (RegionContrastMemory, compute_region_centers,
+                                  contrastive_loss)
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--root_path', type=str,
@@ -57,6 +59,25 @@ parser.add_argument('--consistency', type=float,
                     default=0.1, help='consistency')
 parser.add_argument('--consistency_rampup', type=float,
                     default=200.0, help='consistency_rampup')
+# Frequency-domain contrastive learning
+parser.add_argument('--use_freq_contrast', type=int, default=1,
+                    help='Enable frequency-domain contrastive learning (1=on, 0=off)')
+parser.add_argument('--freq_low_ratio', type=float, default=0.15,
+                    help='Low-pass radius as fraction of Nyquist for FFT split')
+parser.add_argument('--freq_tau', type=float, default=0.15,
+                    help='Temperature for InfoNCE contrastive loss')
+parser.add_argument('--freq_queue_size', type=int, default=200,
+                    help='Max entries per class in the memory bank')
+parser.add_argument('--freq_conf_threshold', type=float, default=0.9,
+                    help='Min confidence to accept unlabeled pseudo-label centers')
+parser.add_argument('--freq_max_neg', type=int, default=128,
+                    help='Max negative samples per contrastive loss computation')
+parser.add_argument('--lambda_freq_low', type=float, default=0.1,
+                    help='Weight for orig-vs-low contrastive loss')
+parser.add_argument('--lambda_freq_high', type=float, default=0.1,
+                    help='Weight for orig-vs-high contrastive loss')
+parser.add_argument('--freq_update_unlabeled', type=int, default=1,
+                    help='Update memory from high-confidence unlabeled samples (1=on)')
 args = parser.parse_args()
 
 
@@ -101,6 +122,15 @@ def train(args, snapshot_path):
 
     model = create_model()
     ema_model = create_model(ema=True)
+
+    # ------------------------------------------------------------------ #
+    # Frequency-domain contrastive memory banks
+    # feat_dim = 256 (deepest encoder output channels in UNet)
+    # ------------------------------------------------------------------ #
+    feat_dim = 256
+    if args.use_freq_contrast:
+        mem_low  = RegionContrastMemory(num_classes, feat_dim, args.freq_queue_size)
+        mem_high = RegionContrastMemory(num_classes, feat_dim, args.freq_queue_size)
 
     def worker_init_fn(worker_id):
         random.seed(args.seed + worker_id)
@@ -149,7 +179,13 @@ def train(args, snapshot_path):
                 unlabeled_volume_batch) * 0.1, -0.2, 0.2)
             ema_inputs = unlabeled_volume_batch + noise
 
-            outputs = model(volume_batch)
+            # -------------------------------------------------------------- #
+            # Student forward pass – optionally return encoder features       #
+            # -------------------------------------------------------------- #
+            if args.use_freq_contrast:
+                outputs, feat_orig = model(volume_batch, return_features=True)
+            else:
+                outputs = model(volume_batch)
             outputs_soft = torch.softmax(outputs, dim=1)
             with torch.no_grad():
                 ema_output = ema_model(ema_inputs)
@@ -186,6 +222,115 @@ def train(args, snapshot_path):
                 mask*consistency_dist)/(2*torch.sum(mask)+1e-16)
 
             loss = supervised_loss + consistency_weight * consistency_loss
+
+            # -------------------------------------------------------------- #
+            # Frequency-domain contrastive learning                           #
+            # -------------------------------------------------------------- #
+            lcon_low_val  = 0.0
+            lcon_high_val = 0.0
+
+            if args.use_freq_contrast:
+                # 1) Decompose the FULL batch into low- and high-frequency views
+                with torch.no_grad():
+                    x_low, x_high = freq_decompose(volume_batch,
+                                                   ratio=args.freq_low_ratio)
+
+                # 2) Encode the two frequency views with the STUDENT encoder
+                #    (shared weights; gradients flow through feat_low/feat_high)
+                _, feat_low  = model(x_low,  return_features=True)
+                _, feat_high = model(x_high, return_features=True)
+
+                # ----------------------------------------------------------
+                # Labeled part: use ground-truth labels
+                # ----------------------------------------------------------
+                gt_labeled = label_batch[:args.labeled_bs]
+
+                centers_orig_lab  = compute_region_centers(
+                    feat_orig[:args.labeled_bs], gt_labeled, num_classes)
+                centers_low_lab   = compute_region_centers(
+                    feat_low[:args.labeled_bs],  gt_labeled, num_classes)
+                centers_high_lab  = compute_region_centers(
+                    feat_high[:args.labeled_bs], gt_labeled, num_classes)
+
+                # Update memory banks from labeled data (always)
+                mem_low.update_from_centers(centers_low_lab)
+                mem_high.update_from_centers(centers_high_lab)
+
+                # ----------------------------------------------------------
+                # Unlabeled part: use teacher pseudo-labels with confidence
+                # filtering
+                # ----------------------------------------------------------
+                if args.freq_update_unlabeled:
+                    # preds is already computed above: mean over MC samples
+                    # shape [unlabeled_bs, num_classes, H, W]
+                    pseudo_probs  = preds                          # softmax applied
+                    pseudo_labels = torch.argmax(pseudo_probs, dim=1)  # [B_u, H, W]
+                    # Per-pixel max probability as confidence
+                    max_probs, _  = torch.max(pseudo_probs, dim=1)     # [B_u, H, W]
+                    # Per-sample confidence: mean max-prob over all pixels
+                    sample_conf   = max_probs.mean(dim=(-2, -1))       # [B_u]
+
+                    centers_low_unlab  = compute_region_centers(
+                        feat_low[args.labeled_bs:],  pseudo_labels, num_classes)
+                    centers_high_unlab = compute_region_centers(
+                        feat_high[args.labeled_bs:], pseudo_labels, num_classes)
+
+                    # Build per-class confidence scores for memory update
+                    def _per_class_conf(pseudo_lbl, conf_per_sample, n_cls):
+                        """Average confidence of samples that contain each class."""
+                        conf_dict = {}
+                        for cls_id in range(n_cls):
+                            present = [(b, conf_per_sample[b])
+                                       for b in range(pseudo_lbl.shape[0])
+                                       if (pseudo_lbl[b] == cls_id).any()]
+                            if present:
+                                conf_dict[cls_id] = torch.stack(
+                                    [c for _, c in present])
+                        return conf_dict
+
+                    conf_dict = _per_class_conf(pseudo_labels,
+                                                sample_conf, num_classes)
+                    mem_low.update_from_centers(
+                        centers_low_unlab, conf_dict,
+                        conf_threshold=args.freq_conf_threshold)
+                    mem_high.update_from_centers(
+                        centers_high_unlab, conf_dict,
+                        conf_threshold=args.freq_conf_threshold)
+
+                # ----------------------------------------------------------
+                # Compute contrastive losses: orig anchors vs low/high memory
+                # Combine labeled and unlabeled orig centers as anchors
+                # ----------------------------------------------------------
+                # Compute unlabeled orig centers once (outside the loop)
+                if args.freq_update_unlabeled:
+                    centers_orig_unlab = compute_region_centers(
+                        feat_orig[args.labeled_bs:],
+                        pseudo_labels, num_classes)
+                else:
+                    centers_orig_unlab = None
+
+                anchor_centers = {}
+                for cls_id in range(num_classes):
+                    vecs = []
+                    if centers_orig_lab[cls_id] is not None:
+                        vecs.append(centers_orig_lab[cls_id])
+                    if centers_orig_unlab is not None:
+                        if centers_orig_unlab[cls_id] is not None:
+                            vecs.append(centers_orig_unlab[cls_id])
+                    anchor_centers[cls_id] = (
+                        torch.cat(vecs, dim=0) if vecs else None)
+
+                lcon_low  = contrastive_loss(
+                    anchor_centers, mem_low,
+                    tau=args.freq_tau, max_neg=args.freq_max_neg)
+                lcon_high = contrastive_loss(
+                    anchor_centers, mem_high,
+                    tau=args.freq_tau, max_neg=args.freq_max_neg)
+
+                loss = loss + (args.lambda_freq_low  * lcon_low
+                               + args.lambda_freq_high * lcon_high)
+                lcon_low_val  = lcon_low.item()
+                lcon_high_val = lcon_high.item()
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -204,6 +349,16 @@ def train(args, snapshot_path):
                               consistency_loss, iter_num)
             writer.add_scalar('info/consistency_weight',
                               consistency_weight, iter_num)
+            if args.use_freq_contrast:
+                writer.add_scalar('freq/Lcon_low',  lcon_low_val,  iter_num)
+                writer.add_scalar('freq/Lcon_high', lcon_high_val, iter_num)
+                # Log current memory bank sizes (first non-empty class as proxy)
+                mem_low_sizes  = [mem_low.size(c)  for c in range(num_classes)]
+                mem_high_sizes = [mem_high.size(c) for c in range(num_classes)]
+                writer.add_scalar('freq/mem_size_low',
+                                  sum(mem_low_sizes),  iter_num)
+                writer.add_scalar('freq/mem_size_high',
+                                  sum(mem_high_sizes), iter_num)
             logging.info(
                 'iteration %d : loss : %f, loss_ce: %f, loss_dice: %f' %
                 (iter_num, loss.item(), loss_ce.item(), loss_dice.item()))
