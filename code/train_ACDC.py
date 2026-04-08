@@ -124,10 +124,11 @@ def train(args, snapshot_path):
     ema_model = create_model(ema=True)
 
     # ------------------------------------------------------------------ #
-    # Frequency-domain contrastive memory banks
-    # feat_dim = 256 (deepest encoder output channels in UNet)
+    # Frequency-domain contrastive memory banks                           #
+    # feat_dim: inferred from the UNet bottleneck (params['feature_chns'] #
+    # last entry = 256).  Derive from model to avoid hardcoding.          #
     # ------------------------------------------------------------------ #
-    feat_dim = 256
+    feat_dim = model.encoder.ft_chns[-1]  # 256 for default UNet config
     if args.use_freq_contrast:
         mem_low  = RegionContrastMemory(num_classes, feat_dim, args.freq_queue_size)
         mem_high = RegionContrastMemory(num_classes, feat_dim, args.freq_queue_size)
@@ -231,9 +232,11 @@ def train(args, snapshot_path):
 
             if args.use_freq_contrast:
                 # 1) Decompose the FULL batch into low- and high-frequency views.
-                #    freq_decompose is differentiable; we detach x_low/x_high here
-                #    so gradients only flow through the encoder weights, not back
-                #    into the input pixel values (same as for the original branch).
+                #    freq_decompose is differentiable w.r.t. its input, but here
+                #    we treat the decomposed images as fixed input views (analogous
+                #    to how `volume_batch` itself is not differentiated w.r.t. the
+                #    pixel values).  Detaching ensures gradients only update the
+                #    shared encoder weights via feat_low/feat_high, not the input.
                 x_low, x_high = freq_decompose(volume_batch,
                                                ratio=args.freq_low_ratio)
                 x_low  = x_low.detach()
@@ -279,9 +282,16 @@ def train(args, snapshot_path):
                     centers_high_unlab = compute_region_centers(
                         feat_high[args.labeled_bs:], pseudo_labels, num_classes)
 
-                    # Build per-class confidence scores for memory update
-                    def _per_class_conf(pseudo_lbl, conf_per_sample, n_cls):
-                        """Average confidence of samples that contain each class."""
+                    # Build per-class confidence tensors for memory update.
+                    # For each class, collect the per-sample confidence values of
+                    # every unlabeled sample that contains at least one pixel of
+                    # that class.  These are used by update_from_centers to filter
+                    # low-confidence pseudo-label centers.
+                    def _gather_class_sample_confidences(pseudo_lbl, conf_per_sample, n_cls):
+                        """Return {cls_id: Tensor[M]} of per-sample confidences.
+
+                        M is the number of unlabeled samples that contain cls_id.
+                        """
                         conf_dict = {}
                         for cls_id in range(n_cls):
                             present = [(b, conf_per_sample[b])
@@ -292,8 +302,8 @@ def train(args, snapshot_path):
                                     [c for _, c in present])
                         return conf_dict
 
-                    conf_dict = _per_class_conf(pseudo_labels,
-                                                sample_conf, num_classes)
+                    conf_dict = _gather_class_sample_confidences(
+                        pseudo_labels, sample_conf, num_classes)
                     mem_low.update_from_centers(
                         centers_low_unlab, conf_dict,
                         conf_threshold=args.freq_conf_threshold)

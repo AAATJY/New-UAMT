@@ -229,6 +229,7 @@ def contrastive_loss(anchor_centers: dict,
         sim_all = torch.cat([sim_pos, sim_neg], dim=1)  # [M, P+N]
         log_den = torch.logsumexp(sim_all, dim=1)        # [M]
 
+        # InfoNCE = -log(pos_sum / all_sum) = log_den - log_num  (minimised)
         loss_cls = (log_den - log_num).mean()
         total_loss = total_loss + loss_cls
         count += 1
